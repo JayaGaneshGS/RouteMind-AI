@@ -1,0 +1,90 @@
+{
+  "model": "RandomForestClassifier (scikit-learn) in a one-hot Pipeline",
+  "dataset": "Synthetic academic-demonstration dataset (not real traffic data)",
+  "train_rows": 1600,
+  "test_rows": 400,
+  "accuracy": 0.8,
+  "precision_weighted": 0.8034,
+  "recall_weighted": 0.8,
+  "f1_weighted": 0.8014,
+  "cv_accuracy_mean": 0.825,
+  "cv_accuracy_std": 0.011,
+  "confusion_matrix": {
+    "labels": [
+      "LOW",
+      "MEDIUM",
+      "HIGH"
+    ],
+    "matrix": [
+      [
+        179,
+        28,
+        2
+      ],
+      [
+        22,
+        75,
+        15
+      ],
+      [
+        0,
+        13,
+        66
+      ]
+    ]
+  },
+  "feature_importances": [
+    {
+      "feature": "historical_traffic_level",
+      "importance": 0.572
+    },
+    {
+      "feature": "hour",
+      "importance": 0.1924
+    },
+    {
+      "feature": "distance",
+      "importance": 0.0708
+    },
+    {
+      "feature": "day_of_week",
+      "importance": 0.0392
+    },
+    {
+      "feature": "route_type_highway",
+      "importance": 0.028
+    },
+    {
+      "feature": "route_type_city",
+      "importance": 0.0249
+    },
+    {
+      "feature": "weather_rain",
+      "importance": 0.0156
+    },
+    {
+      "feature": "weekend",
+      "importance": 0.0146
+    },
+    {
+      "feature": "rain",
+      "importance": 0.0137
+    },
+    {
+      "feature": "route_type_mixed",
+      "importance": 0.0106
+    },
+    {
+      "feature": "weather_clear",
+      "importance": 0.0084
+    },
+    {
+      "feature": "weather_cloudy",
+      "importance": 0.0073
+    },
+    {
+      "feature": "weather_fog",
+      "importance": 0.0023
+    }
+  ]
+}

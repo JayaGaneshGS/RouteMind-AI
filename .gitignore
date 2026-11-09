@@ -1,0 +1,27 @@
+# secrets - never commit
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.vite/
+coverage/
+# Python virtual environments
+venv/
+.venv/
+
+# Build output
+build/
+
+# Windows and macOS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/

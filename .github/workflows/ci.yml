@@ -52,15 +52,51 @@ jobs:
         run: python generate_dataset.py && python train_model.py
       - run: python -m pytest -q
 
+
   docker:
-    name: Docker images build
+    name: Docker build and publish to GHCR
     runs-on: ubuntu-latest
     needs: [frontend, backend, ml-service]
+
+    permissions:
+      contents: read
+      packages: write
+
     steps:
       - uses: actions/checkout@v4
+
       - name: Build all images with docker compose
         env:
-          # Dummy values: only needed so `docker compose` can interpolate the file. Nothing connects to Atlas in CI.
+          COMPOSE_PROJECT_NAME: route-mind
           JWT_SECRET: ci-build-only-not-a-real-secret
           MONGO_URI: mongodb+srv://ci-user:ci-password@example.invalid/?appName=ci
         run: docker compose build
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push Docker images
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          IMAGE_OWNER: jayaganeshgs
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker tag route-mind-frontend:latest ghcr.io/$IMAGE_OWNER/routemind-frontend:latest
+          docker tag route-mind-frontend:latest ghcr.io/$IMAGE_OWNER/routemind-frontend:$IMAGE_TAG
+          docker push ghcr.io/$IMAGE_OWNER/routemind-frontend:latest
+          docker push ghcr.io/$IMAGE_OWNER/routemind-frontend:$IMAGE_TAG
+
+          docker tag route-mind-backend:latest ghcr.io/$IMAGE_OWNER/routemind-backend:latest
+          docker tag route-mind-backend:latest ghcr.io/$IMAGE_OWNER/routemind-backend:$IMAGE_TAG
+          docker push ghcr.io/$IMAGE_OWNER/routemind-backend:latest
+          docker push ghcr.io/$IMAGE_OWNER/routemind-backend:$IMAGE_TAG
+
+          docker tag route-mind-ml-service:latest ghcr.io/$IMAGE_OWNER/routemind-ml-service:latest
+          docker tag route-mind-ml-service:latest ghcr.io/$IMAGE_OWNER/routemind-ml-service:$IMAGE_TAG
+          docker push ghcr.io/$IMAGE_OWNER/routemind-ml-service:latest
+          docker push ghcr.io/$IMAGE_OWNER/routemind-ml-service:$IMAGE_TAG

@@ -36,7 +36,7 @@ export default function Landing() {
             ))}
           </ul>
         </div>
-        <p className="text-xs text-indigo-300">Academic project · traffic prediction is based on the academic/demo training dataset and is not live traffic data.</p>
+        <div aria-hidden="true" />
       </section>
 
       <section className="flex items-center justify-center p-6 sm:p-12">

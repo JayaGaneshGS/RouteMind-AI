@@ -89,7 +89,7 @@ function sampleRoute(route) {
 const fmt = (n) => Number(n).toFixed(6);
 
 /**
- * One Overpass request for all samples of all routes. A small bounding box (± matchRadiusM) around each sample is used
+ * One Overpass query for a set of samples (assessRoads sends the samples in requests of at most `samplesPerRequest`). A small bounding box (± matchRadiusM) around each sample is used
  * instead of an `around` filter: it answers about twice as fast on the public server. Each sample's ways are followed
  * by a `count` element that acts as a delimiter.
  */
@@ -194,33 +194,58 @@ async function assessRoads(routes, opts = {}) {
   const total = sampleSets.reduce((n, s) => n + s.length, 0);
   if (!total) return unavailable(routes.length, 'the routes had no geometry to analyse.');
 
-  let result;
-  try { result = await overpass.run(buildQuery(sampleSets), 'road-tags', opts); } catch (err) {
-    return unavailable(routes.length, `the OpenStreetMap Overpass service could not be reached (${err.kind || 'error'}).`);
-  }
-  let groups;
-  try { groups = splitBySample(result.elements, total); } catch {
-    return unavailable(routes.length, 'the OpenStreetMap response could not be interpreted.');
+  // One Overpass statement per sample: split into requests of at most `samplesPerRequest` so each stays small enough for a
+  // busy public server. A chunk that cannot be retrieved leaves its samples UNKNOWN (no ways), which the coverage rule
+  // already treats as "not documented" - never as good or bad - and the result is flagged incomplete.
+  const flat = sampleSets.flatMap((set, route) => set.map((sample) => ({ sample, route }))); // route-major, same order as the result groups
+  const size = Math.max(1, config.roadQuality.samplesPerRequest);
+  const chunks = Array.from({ length: Math.ceil(flat.length / size) }, (_, c) => flat.slice(c * size, (c + 1) * size));
+  const t0 = Date.now();
+  const results = await overpass.runMany(chunks.map((c) => buildQuery(sampleSets.map((_, route) => c.filter((x) => x.route === route).map((x) => x.sample)))), 'road-tags', opts);
+  const groups = new Array(total).fill(null); // null = this sample's chunk could not be retrieved
+  const lost = [];
+  chunks.forEach((c, ci) => {
+    const r = results[ci];
+    const start = ci * size;
+    try {
+      if (!r.ok) throw r.error;
+      splitBySample(r.elements, c.length).forEach((g, j) => { groups[start + j] = g; });
+    } catch (error) { lost.push(error); }
+  });
+  if (lost.length === chunks.length) {
+    const reached = lost.find((e) => e.kind !== 'parse' && e.kind !== 'skipped');
+    return unavailable(routes.length, lost.every((e) => e.kind === 'parse')
+      ? 'the OpenStreetMap response could not be interpreted.'
+      : `the OpenStreetMap Overpass service could not be reached (${(reached || lost[0]).kind || 'error'}).`);
   }
 
   let offset = 0;
   const perRoute = sampleSets.map((samples) => {
-    const q = summariseRoute(samples, groups.slice(offset, offset + samples.length));
+    const mine = groups.slice(offset, offset + samples.length);
     offset += samples.length;
-    return { ...q, available: false, source: 'OpenStreetMap tags via Overpass API', method: `sampled ${samples.length} points along the route` };
+    const q = summariseRoute(samples, mine.map((g) => g || []));
+    const unretrieved = mine.filter((g) => g === null).length;
+    return {
+      ...q, available: false, source: 'OpenStreetMap tags via Overpass API', method: `sampled ${samples.length} points along the route`,
+      ...(unretrieved ? { incomplete: true, unretrievedShare: round(unretrieved / samples.length, 2) } : {}),
+    };
   });
   const usable = perRoute.some((q) => q.coverage >= config.roadQuality.minCoverage);
   for (const q of perRoute) {
     q.available = usable;
     if (!usable) { q.reason = `fewer than ${pct(config.roadQuality.minCoverage)} of any route has a documented surface or smoothness tag in OpenStreetMap.`; q.score = null; }
-    q.summary = describe({ ...q, available: usable });
+    q.summary = describe({ ...q, available: usable }) + (q.incomplete ? ` Data incomplete: ${pct(q.unretrievedShare)} of the sampled points could not be retrieved from OpenStreetMap and are counted as unknown.` : '');
   }
   log('ROADS', `Sampled ${total} points | coverage ${perRoute.map((q) => pct(q.coverage)).join(' / ')} | usable for ranking: ${usable}`);
   return {
     available: usable,
     reason: usable ? undefined : perRoute[0].reason,
     perRoute,
-    meta: { provider: 'Overpass', requested: true, cached: result.cached, ms: result.ms, samples: total },
+    meta: {
+      provider: 'Overpass', requested: true, cached: results.every((r) => !r.ok || r.cached), ms: Date.now() - t0, samples: total,
+      ...(chunks.length > 1 ? { requests: chunks.length } : {}),
+      ...(lost.length ? { note: `incomplete: ${lost.length} of ${chunks.length} requests failed (${[...new Set(lost.map((e) => e.kind))].join(', ')}); the samples in them are counted as unknown` } : {}),
+    },
   };
 }
 

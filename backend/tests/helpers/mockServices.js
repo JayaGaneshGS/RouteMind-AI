@@ -1,6 +1,7 @@
 // Local stand-ins for Nominatim, OSRM, the Python ML service and an OpenAI-style LLM, so tests are
 // deterministic and never touch public servers.
 const http = require('http');
+const { distanceToPolylineM } = require('../../src/utils');
 
 const PLACES = {
   chennai: { display_name: 'Chennai, Tamil Nadu, India', lat: '13.0836939', lon: '80.270186' },
@@ -8,12 +9,13 @@ const PLACES = {
   bengaluru: { display_name: 'Bengaluru, Karnataka, India', lat: '12.9767936', lon: '77.590082' },
 };
 
-// overpass: up | down (connection dropped) | busy (HTTP 504) | flaky (first request 504, then fine) | garbage (HTML) | remark (200 + runtime-error remark)
+// overpass: up | down (connection dropped) | busy (HTTP 504) | flaky (first request 504, then fine) | second504 (only the 2nd request gets 504) | garbage (HTML) | remark (200 + runtime-error remark)
 // roads:    A_good (Route A's East Coast Road is tagged asphalt+good; NH32 untagged) | B_good (NH32 tagged asphalt; ECR untagged) | none (no surface tags) | unpaved_A
-// refine:   up | down (the second, exact-outline scenery request fails)
-const mode = { osrm: 'two', ml: 'up', llm: 'good', nominatim: 'up', overpass: 'up', roads: 'A_good', refine: 'up' };
-const calls = { nominatim: 0, osrm: 0, ml: 0, overpass: 0, overpassKinds: [], lastNominatim: null, lastOsrm: null, lastOverpass: null };
+// segmentFail: null | (points) => boolean - a scenery corridor-segment request whose polyline satisfies this gets HTTP 504 (others are fine)
+const mode = { osrm: 'two', ml: 'up', llm: 'good', nominatim: 'up', overpass: 'up', roads: 'A_good', segmentFail: null };
+const calls = { nominatim: 0, osrm: 0, ml: 0, overpass: 0, overpassKinds: [], overpassQueries: [], lastNominatim: null, lastOsrm: null, lastOverpass: null };
 const geo = { a: [80.2702, 13.0837], b: [79.8306, 11.934] }; // [lon, lat] of the last OSRM request (for placing mock POIs)
+const midPoint = () => ({ lat: (geo.a[1] + geo.b[1]) / 2, lon: (geo.a[0] + geo.b[0]) / 2 });
 
 function line(a, b, bend = 0) {
   const pts = [];
@@ -106,9 +108,27 @@ function scenicPois() {
     { type: 'node', id: 3, ...offsetFromA(5000), tags: { tourism: 'viewpoint', name: 'Faraway View' } }, // 5 km: must be dropped locally
     { type: 'way', id: 10, bounds: box(offsetFromA(100).lat, offsetFromA(100).lon), tags: { leisure: 'park', name: 'Test Park' } },
     { type: 'relation', id: 20, bounds: box(offsetFromA(100).lat, offsetFromA(100).lon), tags: { leisure: 'park', name: 'Test Park' } }, // same park mapped again
-    { type: 'way', id: 11, bounds: box(bm.lat, bm.lon), tags: { natural: 'water', water: 'lake', name: 'Far Lake' } }, // near Route B only
+    { type: 'way', id: 11, bounds: box(bm.lat + 600 / 111320, bm.lon), tags: { natural: 'water', water: 'lake', name: 'Far Lake' } }, // ~600 m from Route B only
     { type: 'node', id: 4, ...offsetFromA(50), tags: { shop: 'mall', name: 'Mega Mall' } }, // not a scenic category
   ];
+}
+
+/**
+ * What real Overpass answers for one scenery corridor request: the mock POIs within the `around` radius of the segment's polyline
+ * (nodes by exact distance, areas by the distance of their centre - the mock areas are tiny), then a `count` delimiter, then the ids
+ * of the areas within the "near" radius. `mode.segmentFail(points)` makes chosen segments fail with HTTP 504.
+ */
+function segmentElements(q, req, res) {
+  const [, maxM, coords] = /\(around:(\d+),([^)]*)\)/.exec(q);
+  const nearM = Number(/nwr\.a\(around:(\d+),/.exec(q)[1]);
+  const n = coords.split(',').map(Number);
+  const pts = []; for (let i = 0; i < n.length; i += 2) pts.push([n[i], n[i + 1]]);
+  if (mode.segmentFail && mode.segmentFail(pts)) { res.writeHead(504); res.end('<html>busy</html>'); return null; }
+  const dist = (el) => (el.type === 'node' ? distanceToPolylineM([el.lat, el.lon], pts)
+    : distanceToPolylineM([(el.bounds.minlat + el.bounds.maxlat) / 2, (el.bounds.minlon + el.bounds.maxlon) / 2], pts));
+  const inRange = scenicPois().filter((el) => dist(el) <= Number(maxM));
+  const near = inRange.filter((el) => el.type !== 'node' && dist(el) <= nearM);
+  return [...inRange, count(), ...near.map((el) => ({ type: el.type, id: el.id }))];
 }
 
 function overpass(req, res, json) {
@@ -116,10 +136,11 @@ function overpass(req, res, json) {
   return new Promise((resolve) => { let s = ''; req.on('data', (c) => (s += c)); req.on('end', () => resolve(s)); }).then((raw) => {
     const q = new URLSearchParams(raw).get('data') || '';
     calls.lastOverpass = q;
-    const kind = q.includes('out count') && q.includes('["highway"]') ? 'roads' : q.includes('out tags bb') ? 'tiles' : q.includes('->.a;') ? 'refine' : 'other';
+    calls.overpassQueries.push(q);
+    const kind = q.includes('out count') && q.includes('["highway"]') ? 'roads' : q.includes('around:') && q.includes('out tags bb') ? 'segment' : 'other';
     calls.overpassKinds.push(kind);
     if (mode.overpass === 'down') return req.socket.destroy();
-    if (mode.overpass === 'busy' || (mode.overpass === 'flaky' && calls.overpass === 1)) { res.writeHead(504); return res.end('<html>busy</html>'); }
+    if (mode.overpass === 'busy' || (mode.overpass === 'flaky' && calls.overpass === 1) || (mode.overpass === 'second504' && calls.overpass === 2)) { res.writeHead(504); return res.end('<html>busy</html>'); }
     if (mode.overpass === 'garbage') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end('<html>not json</html>'); }
     if (mode.overpass === 'remark') return json(200, { version: 0.6, remark: 'runtime error: Query timed out in "query" at line 3 after 26 seconds.', elements: [] });
     if (kind === 'roads') {
@@ -127,18 +148,7 @@ function overpass(req, res, json) {
       for (const m of q.matchAll(/->\.r(\d+)s(\d+);/g)) elements.push(...roadWays(Number(m[1])), count());
       return json(200, { version: 0.6, elements });
     }
-    if (kind === 'tiles') return json(200, { version: 0.6, elements: scenicPois() });
-    if (kind === 'refine') {
-      if (mode.refine === 'down') return req.socket.destroy();
-      const routes = (q.match(/->\.f\d+;/g) || []).length;
-      const el = (...ids) => ids.map(([type, id]) => ({ type, id }));
-      const elements = [];
-      for (let k = 0; k < routes; k++) {
-        if (k === 0) elements.push(...el(['way', 10], ['relation', 20]), count(), ...el(['way', 10], ['relation', 20]), count()); // Route A: park within 300 m
-        else elements.push(...el(['way', 11]), count(), count()); // Route B: lake within 1 km, not within 300 m
-      }
-      return json(200, { version: 0.6, elements });
-    }
+    if (kind === 'segment') { const els = segmentElements(q, req, res); return els && json(200, { version: 0.6, elements: els }); }
     return json(400, {});
   });
 }
@@ -150,4 +160,4 @@ async function start() {
   return { server, base, mode, calls, stop: () => new Promise((r) => { server.closeAllConnections?.(); server.close(r); }) };
 }
 
-module.exports = { start };
+module.exports = { start, midPoint, geo };

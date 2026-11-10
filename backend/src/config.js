@@ -74,8 +74,11 @@ module.exports = {
     minIntervalMs: num(env.OVERPASS_MIN_INTERVAL_MS, 1100), // per endpoint
     cacheTtlMs: num(env.OVERPASS_CACHE_TTL_MS, 24 * 3600 * 1000), // map features change slowly
     failureCooldownMs: num(env.OVERPASS_COOLDOWN_MS, 30 * 1000), // do not ask the same failed question again for this long
+    concurrency: num(env.OVERPASS_CONCURRENCY, 2), // parallel requests for ONE search (public servers allow ~2 slots per IP)
+    abortAfterFailures: num(env.OVERPASS_ABORT_AFTER_FAILURES, 3), // this many failures before any success -> stop sending the rest of the search's requests
     retries: num(env.OVERPASS_RETRIES, 1), // extra passes over the endpoints that failed with a 5xx / network error
     backoffMs: num(env.OVERPASS_BACKOFF_MS, 1000), // wait before the extra pass; doubles with every pass (plus jitter)
+    endpointFailureThreshold: num(env.OVERPASS_ENDPOINT_FAILURES, 2), // consecutive failed requests before an endpoint is skipped (429 / Retry-After: at once)
     endpointCooldownMs: num(env.OVERPASS_ENDPOINT_COOLDOWN_MS, 30 * 1000), // a failing endpoint is skipped for this long; doubles per consecutive failure
     endpointCooldownMaxMs: num(env.OVERPASS_ENDPOINT_COOLDOWN_MAX_MS, 5 * 60 * 1000),
   },
@@ -84,6 +87,7 @@ module.exports = {
     enabled: (env.ROAD_QUALITY || 'on').toLowerCase() !== 'off',
     sampleSpacingM: num(env.ROAD_SAMPLE_SPACING_M, 2000), // one sample point per this many metres of route...
     maxSamples: num(env.ROAD_MAX_SAMPLES, 30), // ...but never more than this many per route (each costs the public server ~0.25 s)
+    samplesPerRequest: num(env.ROAD_SAMPLES_PER_REQUEST, 20), // one Overpass statement per sample; split into requests of at most this many
     matchRadiusM: num(env.ROAD_MATCH_RADIUS_M, 25), // half-size of the search box around each sample point
     minCoverage: num(env.ROAD_MIN_COVERAGE, 0.2), // share of the route with documented surface/smoothness needed to rank on it
   },
@@ -98,7 +102,12 @@ module.exports = {
     unnamedFactor: num(env.SCENERY_UNNAMED_FACTOR, 0.5), // weight multiplier for viewpoints/beaches that have no name
     simplifyTolM: num(env.SCENERY_SIMPLIFY_TOL_M, 50), // fine route polyline (exact near/far test) deviates at most this much
     maxPolyPoints: num(env.SCENERY_MAX_POLY_POINTS, 250),
-    maxCells: num(env.SCENERY_MAX_CELLS, 8), // POI lookup grid cells per search (each cell = 7 Overpass statements)
+    // The route is cut into ~segmentKm pieces; each piece is ONE small Overpass request (a corridor of maxM around it),
+    // cached on its own. At most maxRequests pieces per search; the length grows (up to 2.5x) before a route is "too long".
+    segmentKm: num(env.SCENERY_SEGMENT_KM, 20),
+    maxRequests: num(env.SCENERY_MAX_REQUESTS, 14),
+    // Share of EVERY route's length whose POIs must have been retrieved to still give a score (flagged "incomplete" below 100 %).
+    minCoverage: num(env.SCENERY_MIN_COVERAGE, 0.7),
   },
   // "Not much longer" without a number in the user's notes means at most this much slower than the fastest route.
   defaultDetourPercent: num(env.DETOUR_DEFAULT_PERCENT, 15),

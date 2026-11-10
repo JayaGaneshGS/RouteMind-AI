@@ -50,7 +50,9 @@ export function sceneryLine(sc) {
   return {
     ok: true,
     headline: `Scenery score ${sc.score}/100`,
-    detail: sc.totalPois ? `${sc.totalPois} nature-related POI${sc.totalPois > 1 ? 's' : ''} near the route${names.length ? `: ${names.join(', ')}` : ''}` : 'No nature-related POIs found near the route in OpenStreetMap',
+    detail: (sc.totalPois ? `${sc.totalPois} nature-related POI${sc.totalPois > 1 ? 's' : ''} near the route${names.length ? `: ${names.join(', ')}` : ''}` : 'No nature-related POIs found near the route in OpenStreetMap')
+      + (sc.incomplete ? ` (data incomplete: only ${Math.round((sc.coverage || 0) * 100)}% of the route could be checked, so the score may be understated)` : ''),
+    incomplete: !!sc.incomplete,
   };
 }
 
@@ -87,4 +89,17 @@ export const todayISO = () => {
 export const nowHHMM = () => {
   const d = new Date();
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+
+/**
+ * One line for the developer diagnostics: what an Overpass call (road tags / scenery) actually did.
+ * A scenery search with failed corridor segments is labelled INCOMPLETE; a search that produced no data shows as "request not completed".
+ */
+export const overpassText = (m) => {
+  if (typeof m === 'string') return m;
+  const failed = m.segmentsFailed || 0;
+  return `${m.provider}${m.requested === false ? ' · request not completed' : m.cached ? ' (cached)' : ` · ${m.ms} ms`}`
+    + (m.samples ? ` · ${m.samples} sample points` : '')
+    + (m.segments ? ` · ${m.segments - failed}/${m.segments} corridor segments${failed ? ' (INCOMPLETE)' : ''}, ${m.candidates} candidates` : m.tiles ? ` · ${m.tiles} map tiles, ${m.candidates} candidates` : '')
+    + (m.note ? ` · ${m.note}` : '');
 };

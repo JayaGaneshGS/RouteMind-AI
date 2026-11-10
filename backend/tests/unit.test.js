@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const { buildWeights, scoreRoutes, PRESETS, AXES } = require('../src/services/scoring');
 const ai = require('../src/services/ai');
 const { parseDeparture, routeTypeOf, estimateCost } = require('../src/services/planner');
-const { haversineKm, decimate, formatDuration } = require('../src/utils');
+const { haversineKm, decimate, formatDuration, polylineLengthM } = require('../src/utils');
 const { User, Trip } = require('../src/models');
 
 const mk = (id, min, cost, level) => ({
@@ -380,24 +380,66 @@ describe('scenery: POI proximity to route geometry, duplicates, caps', () => {
     assert.equal(sceneryService.classify({ landuse: 'forest' }), null); // unnamed
     assert.equal(sceneryService.classify({ landuse: 'forest', name: 'Reserve Forest' }).category, 'forest');
   });
-  it('tile planning grows the cell size to stay within maxCells, and gives up on huge routes', () => {
-    const small = sceneryService.tilesFor([[[13.0, 80.0], [13.0, 80.1]]]);
-    assert.ok(small.cells.length <= appConfig.scenery.maxCells && small.size === 0.1);
-    const long = sceneryService.tilesFor([[[11.9, 79.8], [13.1, 80.3]]]);
-    assert.ok(long.cells.length <= appConfig.scenery.maxCells && long.size > 0.1);
-    assert.equal(sceneryService.tilesFor([[[0, 0], [40, 40]]]), null);
+  it('splitLine cuts a polyline into equal-length pieces that join up and lose nothing', () => {
+    const line = [[13.0, 80.0], [13.0, 80.1], [13.05, 80.1]];
+    const pieces = sceneryService.splitLine(line, 4);
+    assert.equal(pieces.length, 4);
+    const lens = pieces.map(polylineLengthM);
+    const total = polylineLengthM(line);
+    assert.ok(Math.abs(lens.reduce((a, b) => a + b, 0) - total) < 1, 'total length preserved');
+    for (const l of lens) assert.ok(Math.abs(l - total / 4) < 50, `piece ${l} vs ${total / 4}`);
+    for (let i = 1; i < pieces.length; i++) assert.deepEqual(pieces[i][0], pieces[i - 1][pieces[i - 1].length - 1]);
+    assert.deepEqual(pieces[0][0], line[0]);
+    assert.deepEqual(pieces[3][pieces[3].length - 1], line[2]);
+    assert.deepEqual(sceneryService.splitLine(line, 1), [line]);
   });
-  it('the tile query only asks for whitelisted tags, bounded by the number of cells', () => {
-    const t = sceneryService.tilesFor([[[13.0, 80.0], [13.0, 80.1]]]);
-    const q = sceneryService.buildTileQuery(t.cells, sceneryService.CATEGORY_KEYS);
-    assert.equal((q.match(/nwr\[/g) || []).length, t.cells.length * 7);
-    assert.ok(!/shop|amenity/.test(q));
-    assert.equal((sceneryService.buildTileQuery(t.cells, ['beach']).match(/nwr\[/g) || []).length, t.cells.length);
+  it('segment planning: ~segmentKm pieces, stretched for long routes, capped at maxRequests, null if absurd', () => {
+    const route = (km) => Array.from({ length: 21 }, (_, i) => [13.0, 80.0 + (i * km) / 20 / 108.4]);
+    const small = sceneryService.planSegments([route(10)]);
+    assert.equal(small.length, 1); // short route: one request
+    const mid = sceneryService.planSegments([route(100)]);
+    assert.equal(mid.length, 5);
+    for (const s of mid) assert.ok(Math.abs(s.lengthM - 20000) < 500, String(s.lengthM));
+    const long = sceneryService.planSegments([route(300)]); // 300 km would need 15 pieces of 20 km -> stretched to 14
+    assert.ok(long.length <= appConfig.scenery.maxRequests && long[0].lengthM > 20000, 'stretched');
+    assert.ok(long.length >= 10);
+    assert.equal(sceneryService.planSegments([route(2000)]), null);
+    const two = sceneryService.planSegments([route(150), route(160)]);
+    assert.ok(two.length <= appConfig.scenery.maxRequests);
+    assert.deepEqual([...new Set(two.map((s) => s.route))], [0, 1]);
   });
-  it('parseRefine rejects a malformed response instead of guessing', () => {
-    assert.throws(() => sceneryService.parseRefine([{ type: 'count' }], 2), /Expected 4 result blocks/);
-    const ok = sceneryService.parseRefine([{ type: 'way', id: 1 }, { type: 'count' }, { type: 'count' }], 1);
-    assert.ok(ok[0].far.has('way/1') && ok[0].near.size === 0);
+  it('segment planning is deterministic (same route -> same queries -> cache hits)', () => {
+    const line = Array.from({ length: 30 }, (_, i) => [13.0 + i * 0.01, 80.0 + i * 0.012]);
+    const q = () => sceneryService.planSegments([line]).map((s) => sceneryService.buildSegmentQuery(s.line, sceneryService.CATEGORY_KEYS));
+    assert.deepEqual(q(), q());
+  });
+  it('the segment query: only whitelisted tags, a corridor (around), one near-pass for areas, no bounding box', () => {
+    const q = sceneryService.buildSegmentQuery([[13.0, 80.0], [13.0, 80.1]], sceneryService.CATEGORY_KEYS);
+    assert.equal((q.match(/nwr\[/g) || []).length, 7); // the seven whitelisted statements, once each
+    assert.equal((q.match(/around:1000,/g) || []).length, 7);
+    assert.match(q, /nwr\.a\(around:300,/);
+    assert.match(q, /\.c out tags bb;\.c out count;/);
+    assert.ok(!/shop|amenity|highway/.test(q));
+    assert.ok(q.length < 2500);
+    const beachOnly = sceneryService.buildSegmentQuery([[13.0, 80.0], [13.0, 80.1]], ['beach']);
+    assert.equal((beachOnly.match(/nwr\[/g) || []).length, 1);
+  });
+  it('parseSegment splits candidates from the near ids and rejects a response without the delimiter', () => {
+    const r = sceneryService.parseSegment([{ type: 'node', id: 1, lat: 1, lon: 2, tags: {} }, { type: 'way', id: 2, bounds: {}, tags: {} }, { type: 'count' }, { type: 'way', id: 2 }]);
+    assert.equal(r.candidates.length, 2);
+    assert.deepEqual([...r.near], ['way/2']);
+    assert.throws(() => sceneryService.parseSegment([{ type: 'node', id: 1 }]), /no delimiter/);
+  });
+  it('collectRoute merges segments: de-duplicated candidates, exact far/near sets, covered share of the route length', () => {
+    const park = { type: 'way', id: 5, bounds: { minlat: 1, minlon: 1, maxlat: 2, maxlon: 2 }, tags: { leisure: 'park', name: 'P' } };
+    const beach = { type: 'node', id: 6, lat: 1, lon: 1, tags: { natural: 'beach' } };
+    const seg = (ok, lengthM, candidates = [], near = []) => ({ ok, lengthM, candidates, near: new Set(near) });
+    const r = sceneryService.collectRoute([seg(true, 1000, [park, beach], ['way/5']), seg(true, 1000, [park]), seg(false, 2000)]);
+    assert.equal(r.elements.length, 2); // the park seen in two segments counts once
+    assert.deepEqual([...r.exact.far], ['way/5']); // nodes are measured locally, not listed here
+    assert.deepEqual([...r.exact.near], ['way/5']);
+    assert.equal(r.coverage, 0.5);
+    assert.deepEqual([r.segments, r.failed], [3, 1]);
   });
 });
 

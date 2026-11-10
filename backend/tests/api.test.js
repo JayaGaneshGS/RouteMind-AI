@@ -47,13 +47,13 @@ after(async () => {
 });
 
 beforeEach(async () => {
-  Object.assign(svc.mode, { osrm: 'two', ml: 'up', llm: 'good', nominatim: 'up', overpass: 'up', roads: 'A_good', refine: 'up' });
+  Object.assign(svc.mode, { osrm: 'two', ml: 'up', llm: 'good', nominatim: 'up', overpass: 'up', roads: 'A_good', segmentFail: null });
   require('../src/services/geocode')._cache.clear();
   require('../src/services/routing')._cache.clear();
   require('../src/services/overpass')._reset();
   require('../src/diagnostics').reset();
   config.mlFallback = true;
-  Object.assign(svc.calls, { nominatim: 0, osrm: 0, ml: 0, overpass: 0, overpassKinds: [], lastNominatim: null, lastOsrm: null, lastOverpass: null });
+  Object.assign(svc.calls, { nominatim: 0, osrm: 0, ml: 0, overpass: 0, overpassKinds: [], overpassQueries: [], lastNominatim: null, lastOsrm: null, lastOverpass: null });
   config.ai.apiKey = '';
   if (realMongo) { const { User, Trip } = require('../src/models'); await Promise.all([User.deleteMany({}), Trip.deleteMany({})]); } else fakeDb.reset();
 });
@@ -498,7 +498,8 @@ describe('Better Road Conditions', () => {
     svc.mode.overpass = 'flaky';
     const r = await search(roads);
     assert.equal(r.body.roadQuality.available, true);
-    assert.equal(svc.calls.overpass, 2);
+    const requests = Math.ceil(r.body.diagnostics.overpass.roadTags.samples / config.roadQuality.samplesPerRequest);
+    assert.equal(svc.calls.overpass, requests + 1); // every chunk once, plus one retry of the chunk that got the 504
   });
   it('results are cached: the second identical search sends no Overpass request', async () => {
     await search(roads);
@@ -507,12 +508,29 @@ describe('Better Road Conditions', () => {
     assert.equal(again.body.roadQuality.available, true);
     assert.equal(svc.calls.overpass, n);
   });
-  it('the Overpass request is bounded: one request, at most maxSamples statements per route', async () => {
-    await search(roads);
-    assert.equal(svc.calls.overpass, 1);
-    assert.equal(svc.calls.overpassKinds[0], 'roads');
-    const statements = (svc.calls.lastOverpass.match(/out count;/g) || []).length;
-    assert.ok(statements <= 2 * config.roadQuality.maxSamples);
+  it('the Overpass requests are bounded: at most maxSamples statements per route, split into small requests', async () => {
+    const r = await search(roads);
+    const total = r.body.diagnostics.overpass.roadTags.samples;
+    assert.ok(total <= 2 * config.roadQuality.maxSamples);
+    assert.equal(svc.calls.overpass, Math.ceil(total / config.roadQuality.samplesPerRequest));
+    assert.ok(svc.calls.overpass > 1, 'a long two-route search is split instead of sent as one big request');
+    assert.ok(svc.calls.overpassKinds.every((k) => k === 'roads'));
+    for (const q of svc.calls.overpassQueries) assert.ok((q.match(/out count;/g) || []).length <= config.roadQuality.samplesPerRequest);
+    assert.equal(svc.calls.overpassQueries.reduce((n, q) => n + (q.match(/out count;/g) || []).length, 0), total); // every sample asked exactly once
+  });
+  it('one road request fails: the other samples still count, the lost ones are UNKNOWN (not bad), and the result says it is incomplete', async () => {
+    config.overpass.endpointFailureThreshold = 2; config.overpass.retries = 0;
+    svc.mode.overpass = 'second504'; // only the 2nd request of the search gets HTTP 504
+    const r = await search(roads);
+    config.overpass.endpointFailureThreshold = 2; // default config.overpass.retries = 1;
+    assert.equal(r.status, 200);
+    const rq = r.body.routes[0].roadQuality;
+    assert.equal(r.body.roadQuality.available, true);
+    assert.equal(rq.incomplete, true);
+    assert.ok(rq.unretrievedShare > 0 && rq.unretrievedShare < 1);
+    assert.match(rq.summary, /Data incomplete/);
+    assert.ok(r.body.warnings.some((w) => /Road quality data is incomplete/.test(w)));
+    assert.match(r.body.diagnostics.overpass.roadTags.note, /incomplete: 1 of/);
   });
   it('road-quality analysis switched off -> unavailable, no Overpass call', async () => {
     config.roadQuality.enabled = false;
@@ -549,19 +567,45 @@ describe('Better Scenery', () => {
     assert.ok(!/official/i.test(a.scenery.summary.replace(/not an official/i, '')));
     assert.match(a.scenery.source, /OpenStreetMap/);
   });
-  it('two Overpass requests are used (tiles, then the exact area test) and both are cached', async () => {
-    await search(scenery);
-    assert.deepEqual(svc.calls.overpassKinds, ['tiles', 'refine']);
-    await search(scenery);
-    assert.equal(svc.calls.overpass, 2);
-  });
-  it('if only the exact-outline request fails, scenery is still shown but flagged approximate', async () => {
-    svc.mode.refine = 'down';
+  it('scenery uses several SMALL corridor requests (no tiles, no separate refine) and every one is cached', async () => {
     const r = await search(scenery);
-    assert.equal(r.body.routes[0].scenery.available, true);
-    assert.equal(r.body.routes[0].scenery.approximate, true);
-    assert.match(r.body.routes[0].scenery.summary, /approximate/);
-    assert.match(r.body.diagnostics.overpass.scenery.note, /bounding-box/);
+    const n = svc.calls.overpass;
+    assert.ok(n > 1 && n <= config.scenery.maxRequests, 'requests: ' + n);
+    assert.ok(svc.calls.overpassKinds.every((k) => k === 'segment'));
+    assert.equal(r.body.diagnostics.overpass.scenery.segments, n);
+    for (const q of svc.calls.overpassQueries) assert.ok(q.length < 4000 && /around:1000,/.test(q), 'query size ' + q.length);
+    await search(scenery);
+    assert.equal(svc.calls.overpass, n); // identical search: nothing sent at all
+  });
+  it('one corridor segment fails: scenery is still scored from the rest and flagged incomplete, with a warning', async () => {
+    config.overpass.endpointFailureThreshold = 2;
+    // fail the first segment of each route (both start at the origin; neither holds the beach, the park or the lake)
+    svc.mode.segmentFail = (pts) => Math.abs(pts[0][0] - mock.geo.a[1]) < 1e-3 && Math.abs(pts[0][1] - mock.geo.a[0]) < 1e-3;
+    const r = await search(scenery);
+    config.overpass.endpointFailureThreshold = 2; // default
+    assert.equal(r.status, 200);
+    assert.equal(r.body.scenery.available, true);
+    assert.equal(r.body.scenery.incomplete, true);
+    const [a, b] = r.body.routes;
+    assert.equal(a.scenery.incomplete, true);
+    assert.ok(a.scenery.coverage >= 0.7 && a.scenery.coverage < 1 && b.scenery.coverage >= 0.7 && b.scenery.coverage < 1);
+    assert.match(a.scenery.summary, /Data incomplete/);
+    assert.equal(b.scenery.incomplete, true);
+    assert.ok(a.scenery.score > 0 && a.scenery.pois.some((p) => p.name === 'Test Beach'));
+    assert.ok(r.body.warnings.some((w) => /Scenery data is incomplete/.test(w)));
+    assert.match(r.body.diagnostics.overpass.scenery.note, /incomplete/);
+  });
+  it('too few segments retrieved -> scenery unavailable (all-or-nothing across routes; never scored as 0)', async () => {
+    config.overpass.endpointFailureThreshold = 99; config.overpass.retries = 0;
+    const mid = mock.midPoint();
+    svc.mode.segmentFail = (pts) => pts[0][0] < mid.lat; // the whole southern half of every route
+    const r = await search(scenery);
+    config.overpass.endpointFailureThreshold = 2; // default config.overpass.retries = 1;
+    assert.equal(r.body.scenery.available, false);
+    assert.match(r.body.scenery.reason, /could only be retrieved for \d+ % of Route A/);
+    assert.ok(r.body.routes.every((x) => x.scenery.available === false && x.scenery.score === null && x.scenery.pois.length === 0));
+    assert.deepEqual(r.body.weightsDroppedForMissingData, ['scenery']);
+    assert.ok(r.body.warnings.some((w) => /Scenery information unavailable/.test(w)));
   });
   it('Overpass unavailable -> "Scenery information unavailable", no POIs, recommendation from time/traffic/cost', async () => {
     svc.mode.overpass = 'down';
@@ -606,7 +650,7 @@ describe('Let AI decide: road conditions, scenery, combined priorities', () => {
     assert.equal(r.body.preference, 'BALANCED');
     assert.ok(r.body.weights.road >= 0.3 && r.body.weights.scenery >= 0.3);
     assert.equal(r.body.roadQuality.requested, true); assert.equal(r.body.scenery.requested, true);
-    assert.ok(svc.calls.overpassKinds.includes('roads') && svc.calls.overpassKinds.includes('tiles'));
+    assert.ok(svc.calls.overpassKinds.includes('roads') && svc.calls.overpassKinds.includes('segment'));
   });
   it('"good road conditions and less traffic" -> road preference with a raised traffic weight', async () => {
     const plain = await search({ ...demo, preference: 'BETTER_ROADS' });

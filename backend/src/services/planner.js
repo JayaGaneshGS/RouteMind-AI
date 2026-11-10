@@ -148,6 +148,8 @@ async function searchRoutes({ origin, destination, date, time, preference, notes
   });
   if (roadRes && !roadRes.available) warnings.push(`Road quality data unavailable: ${roadRes.reason} The recommendation is based only on the attributes that are available (time, traffic, cost).`);
   if (sceneryRes && !sceneryRes.available) warnings.push(`Scenery information unavailable: ${sceneryRes.reason} The recommendation is based only on the attributes that are available (time, traffic, cost).`);
+  if (roadRes?.available && roadRes.meta?.note) warnings.push(`Road quality data is incomplete: ${roadRes.meta.note.replace(/^incomplete: /, '')}.`);
+  if (sceneryRes?.available && sceneryRes.incomplete) warnings.push(`Scenery data is incomplete: ${sceneryRes.meta.note.replace(/^incomplete: /, '')}. Scores count only the places that could be retrieved and may understate a route's scenery, so the scenery comparison is less reliable.`);
   if (wantRoad && priorities?.unsupported?.length) warnings.push(`Your notes mention ${priorities.unsupported.join(' and ')}. That information is not available from the data sources used, so road ranking uses only documented surface and smoothness tags.`);
 
   // --- Scoring (+ light personalisation from preferences and trip history) ---
@@ -171,7 +173,7 @@ async function searchRoutes({ origin, destination, date, time, preference, notes
     weights: { time: round3(eff.weights.time), traffic: round3(eff.weights.traffic), cost: round3(eff.weights.cost), road: round3(eff.weights.road), scenery: round3(eff.weights.scenery) },
     ...(eff.dropped.length ? { weightsDroppedForMissingData: eff.dropped } : {}),
     roadQuality: roadRes ? { requested: true, available: roadRes.available, reason: roadRes.reason } : { requested: false },
-    scenery: sceneryRes ? { requested: true, available: sceneryRes.available, reason: sceneryRes.reason, categories: priorities?.sceneryCategories?.length ? priorities.sceneryCategories : null } : { requested: false },
+    scenery: sceneryRes ? { requested: true, available: sceneryRes.available, reason: sceneryRes.reason, ...(sceneryRes.incomplete ? { incomplete: true } : {}), categories: priorities?.sceneryCategories?.length ? priorities.sceneryCategories : null } : { requested: false },
     constraints,
     personalization: { applied: w.personalised, basedOnTrips: w.historyCount, notes: w.notes },
     aiInterpretation: noteText ? { text: noteText, ...interpretation } : null,

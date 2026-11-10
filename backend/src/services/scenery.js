@@ -13,15 +13,16 @@
 //    kind of POI cannot dominate.
 //  - Proximity is measured to the route line: full weight within `nearM`, `ringWeight` out to `maxM`, nothing beyond.
 //
-// Two Overpass requests (the public server is slow for long polyline queries, so the work is split):
-//  1. TILES: all whitelisted POIs inside the grid cells the routes pass through, with their bounding boxes.
-//     Point POIs are then measured exactly against the route line here. Areas get a bounding-box distance, which can
-//     only UNDER-estimate the true distance, so it is used to discard POIs that are certainly too far.
-//  2. REFINE: for the few remaining areas, Overpass itself tests their real outline against the route (near / far).
-//     If this second request fails the areas are kept but flagged `approximate` (bounding-box distance).
+// Overpass requests (the public servers are slow for big or long queries, so the work is split into small pieces):
+//  Each route is cut into segments of about `segmentKm` (20 km). Every segment is ONE request for a thin corridor
+//  (`maxM` = 1 km) around just that piece: the whitelisted POIs within range, with their tags and bounding boxes, and - in
+//  the same request - the ids of the areas that are within `nearM` (Overpass tests the real outline of areas itself).
+//  Point POIs are additionally measured exactly against the route line here. Segments are cached and de-duplicated one by
+//  one; if some fail but every route still has enough of its length covered, the score is computed from what was
+//  retrieved and flagged `incomplete`; otherwise scenery is "unavailable" - never a score of 0 for missing data.
 const config = require('../config');
 const overpass = require('./overpass');
-const { distanceToPolylineM, haversineKm, simplifyLine, pointToSegmentM } = require('../utils');
+const { distanceToPolylineM, haversineKm, simplifyLine, pointToSegmentM, polylineLengthM } = require('../utils');
 const { log } = require('../log');
 
 /* ---------- Categories (relevance weights are an editorial choice, documented in the README) ---------- */
@@ -94,70 +95,70 @@ function distanceToBoxM(line, b) {
 /** The fine route line: sent to Overpass for the exact area test AND used locally, so both agree. */
 const queryLine = (route) => simplifyLine(route.analysis?.line || route.geometry || [], config.scenery.simplifyTolM, config.scenery.maxPolyPoints);
 
-/* ---------- Overpass queries ---------- */
+/* ---------- Overpass queries: one small corridor request per route segment ---------- */
 
-const CELL_SIZES = [0.1, 0.15, 0.2, 0.3, 0.45, 0.6, 0.9];
+const SEGMENT_STRETCH = 2.5; // segments may grow to 2.5x `segmentKm` to stay within `maxRequests`; beyond that a route is "too long"
+
+const lerp = (a, b, f) => [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
+
+/** Cuts a polyline into `n` pieces of equal length (cut points are interpolated). Neighbouring pieces share their end point. */
+function splitLine(line, n) {
+  if (n <= 1 || line.length < 2) return [line];
+  const total = polylineLengthM(line);
+  const pieces = []; let cur = [line[0]]; let walked = 0;
+  for (let i = 1; i < line.length; i++) {
+    let from = line[i - 1]; const to = line[i];
+    let d = polylineLengthM([from, to]);
+    while (pieces.length < n - 1 && d > 0 && walked + d >= (total * (pieces.length + 1)) / n - 1e-6) {
+      const need = Math.min(d, (total * (pieces.length + 1)) / n - walked);
+      const p = lerp(from, to, need / d);
+      cur.push(p); pieces.push(cur); cur = [p];
+      walked += need; d -= need; from = p;
+    }
+    if (d > 0 || cur.length < 2) cur.push(to);
+    walked += d;
+  }
+  pieces.push(cur);
+  return pieces;
+}
 
 /**
- * Grid cells (degrees) that the routes pass through, widened by maxM so POIs just outside a cell edge are not missed.
- * The cell size grows until at most `maxCells` cells are needed; returns null if even the largest size is not enough.
+ * Plans the requests. Instead of ONE bounding box over the whole route (which grows with the route and made every public
+ * server time out), each route's fine line is cut into equal pieces of about `segmentKm`; every piece becomes one request
+ * for a thin corridor (`maxM`) around just that piece. Total pieces <= `maxRequests`: the piece length is stretched (up to
+ * 2.5x) for long routes, and null is returned if even that is not enough.
+ * Returns [{ route, index, line, lengthM }] in route order, then along the route.
  */
-function tilesFor(lines) {
-  const bufLat = config.scenery.maxM / 111320;
-  for (const size of CELL_SIZES) {
-    const cells = new Map();
-    for (const line of lines) {
-      for (let i = 0; i < line.length; i++) {
-        // walk each segment in steps smaller than a cell so no cell is skipped
-        const a = line[i]; const b = line[i + 1] || line[i];
-        const steps = Math.max(1, Math.ceil(Math.max(Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1])) / (size / 2)));
-        for (let s = 0; s <= steps; s++) {
-          const la = a[0] + ((b[0] - a[0]) * s) / steps; const lo = a[1] + ((b[1] - a[1]) * s) / steps;
-          const bufLon = bufLat / Math.max(0.2, Math.cos((la * Math.PI) / 180));
-          for (let r = Math.floor((la - bufLat) / size); r <= Math.floor((la + bufLat) / size); r++) {
-            for (let c = Math.floor((lo - bufLon) / size); c <= Math.floor((lo + bufLon) / size); c++) cells.set(`${r},${c}`, [r, c]);
-          }
-        }
-      }
-      if (cells.size > config.scenery.maxCells) break;
-    }
-    if (cells.size <= config.scenery.maxCells) {
-      return { size, cells: [...cells.values()].map(([r, c]) => ({ s: r * size, w: c * size, n: (r + 1) * size, e: (c + 1) * size })) };
+function planSegments(lines) {
+  const base = config.scenery.segmentKm * 1000;
+  const lengths = lines.map(polylineLengthM);
+  for (let target = base; target <= base * SEGMENT_STRETCH + 1; target *= 1.1) {
+    const counts = lengths.map((len) => Math.max(1, Math.ceil(len / target - 1e-9)));
+    if (counts.reduce((a, b) => a + b, 0) <= config.scenery.maxRequests) {
+      return lines.flatMap((line, route) => splitLine(line, counts[route]).map((piece, index) => ({ route, index, line: piece, lengthM: polylineLengthM(piece) })));
     }
   }
   return null;
 }
 
-/** Step 1: every whitelisted POI inside the cells. Elements come back with tags and bounds (`bb`). */
-function buildTileQuery(cells, categories) {
-  const stmts = STATEMENTS.filter((st) => st.cats.some((c) => categories.includes(c)));
-  const body = cells.flatMap((c) => stmts.map((st) => `nwr${st.q}(${fmt(c.s)},${fmt(c.w)},${fmt(c.n)},${fmt(c.e)});`));
-  return `[out:json][timeout:${overpass.serverTimeoutSeconds()}];(${body.join('')});out tags bb;`;
-}
-
 /**
- * Step 2: for the area candidates (`refs` = ['way/1', 'relation/2']) ask Overpass which lie within maxM / nearM of each
- * route's fine line. Per route: `.fK` (far) ids, count, `.nK` (near) ids, count.
+ * ONE request for ONE segment: the whitelisted features within `maxM` of the segment (`around`, so only elements really
+ * in range come back - areas are measured against their outline by Overpass itself), then, after a `count` delimiter,
+ * the ids of the area candidates within `nearM`. This replaces the old "tiles" request AND the separate "refine" request.
  */
-function buildRefineQuery(refs, fineLines) {
+function buildSegmentQuery(line, categories) {
   const { maxM, nearM } = config.scenery;
-  const ids = (type) => refs.filter((r) => r.startsWith(`${type}/`)).map((r) => r.split('/')[1]);
-  const w = ids('way'); const r = ids('relation');
-  const out = [`[out:json][timeout:${overpass.serverTimeoutSeconds()}];(${w.length ? `way(id:${w.join(',')});` : ''}${r.length ? `relation(id:${r.join(',')});` : ''})->.a;`];
-  fineLines.forEach((line, k) => {
-    const p = polyArgs(line);
-    out.push(`nwr.a(around:${maxM},${p})->.f${k};.f${k} out ids;.f${k} out count;`);
-    out.push(`nwr.f${k}(around:${nearM},${p})->.n${k};.n${k} out ids;.n${k} out count;`);
-  });
-  return out.join('\n');
+  const stmts = STATEMENTS.filter((st) => st.cats.some((c) => categories.includes(c)));
+  const p = polyArgs(line);
+  return `[out:json][timeout:${overpass.serverTimeoutSeconds()}];(${stmts.map((st) => `nwr${st.q}(around:${maxM},${p});`).join('')})->.c;`
+    + `.c out tags bb;.c out count;(way.c;relation.c;)->.a;nwr.a(around:${nearM},${p})->.n;.n out ids;`;
 }
 
-/** Per route: { far: Set('type/id'), near: Set('type/id') }. */
-function parseRefine(elements, routeCount) {
-  const blocks = []; let cur = [];
-  for (const el of elements) { if (el.type === 'count') { blocks.push(cur); cur = []; } else cur.push(`${el.type}/${el.id}`); }
-  if (blocks.length !== routeCount * 2) throw new overpass.OverpassError('parse', `Expected ${routeCount * 2} result blocks from Overpass, got ${blocks.length}`);
-  return Array.from({ length: routeCount }, (_, k) => ({ far: new Set(blocks[2 * k]), near: new Set(blocks[2 * k + 1]) }));
+/** Splits a segment response at its `count` delimiter: { candidates: [elements with tags/bounds], near: Set('type/id') }. */
+function parseSegment(elements) {
+  const i = elements.findIndex((e) => e.type === 'count');
+  if (i < 0) throw new overpass.OverpassError('parse', 'Overpass response for a route segment had no delimiter');
+  return { candidates: elements.slice(0, i), near: new Set(elements.slice(i + 1).map((e) => `${e.type}/${e.id}`)) };
 }
 
 /* ---------- Scoring ---------- */
@@ -183,8 +184,8 @@ function dedupe(pois) {
 }
 
 /**
- * Which areas are within range of this route, and how close: `exact` (Overpass tested the real outline) or, when the
- * refine step was not available, the bounding-box distance. Nodes are always measured exactly here.
+ * Which areas are within range of this route, and how close: `exact` (Overpass tested the real outline - the normal case)
+ * or, when no exact sets are passed (direct calls / tests only), the bounding-box distance. Nodes are always measured exactly here.
  * Returns { band, distanceM, proximity } or null if the POI is out of range.
  */
 function proximityOf(el, line, exact) {
@@ -203,8 +204,8 @@ function proximityOf(el, line, exact) {
 }
 
 /**
- * Scores one route. `line` = the route polyline; `elements` = candidate OSM elements; `exact` = the refine result for this
- * route ({far, near} sets) or null; `wanted` limits counted categories (null = all). Pure function - unit tested with
+ * Scores one route. `line` = the route polyline; `elements` = candidate OSM elements; `exact` = the far/near sets of the areas
+ * Overpass tested for this route ({far, near}) or null; `wanted` limits counted categories (null = all). Pure function - unit tested with
  * synthetic geometry.
  */
 function scoreRoute(line, elements, exact = null, wanted = null) {
@@ -263,9 +264,39 @@ const unavailable = (n, reason) => ({
   meta: { provider: 'Overpass', requested: false },
 });
 
+const pct = (x) => `${Math.round(x * 100)} %`;
+const routeName = (k) => `Route ${String.fromCharCode(65 + k)}`;
+
+/** Merges the successful segments of one route: candidates (de-duplicated), the exact far/near sets, and how much of the route was covered. */
+function collectRoute(segments) {
+  const total = segments.reduce((s, x) => s + x.lengthM, 0) || 1;
+  const done = segments.filter((s) => s.ok);
+  const byKey = new Map(); const near = new Set();
+  for (const s of done) {
+    for (const el of s.candidates) byKey.set(`${el.type}/${el.id}`, el);
+    s.near.forEach((k) => near.add(k));
+  }
+  const elements = [...byKey.values()].filter((e) => (e.type === 'node' ? Number.isFinite(e.lat) : !!e.bounds));
+  // Every area that came back is within maxM of this route (Overpass tested its outline); `near` is the subset within nearM.
+  const far = new Set(elements.filter((e) => e.type !== 'node').map((e) => `${e.type}/${e.id}`));
+  return {
+    elements, exact: { far, near },
+    coverage: done.reduce((s, x) => s + x.lengthM, 0) / total,
+    segments: segments.length, failed: segments.length - done.length,
+  };
+}
+
+const INCOMPLETE_NOTE = (coverage) => ` Data incomplete: nature-related places could only be retrieved for ${pct(coverage)} of this route, so the score covers that part only and may understate its scenery.`;
+
 /**
  * routes: planner routes carrying `analysis`. categories: optional subset of CATEGORY_KEYS the traveller asked for.
  * Never throws: a failure becomes `{ available:false, reason }` and the UI says scenery information is unavailable.
+ *
+ * Each route is cut into segments, one small Overpass request each (cached / de-duplicated / failed-over individually).
+ *  - Every segment retrieved   -> normal result.
+ *  - Some segments failed but every route still has >= SCENERY_MIN_COVERAGE of its length retrieved -> a score from what
+ *    WAS retrieved, flagged `incomplete` (with the covered share) on the result, on each route and in its summary.
+ *  - Otherwise -> unavailable. Missing data is never counted as "no scenery" (score 0) and never invented.
  */
 async function assessScenery(routes, categories = null, opts = {}) {
   if (!config.scenery.enabled) return unavailable(routes.length, 'scenery analysis is switched off (SCENERY=off).');
@@ -273,48 +304,54 @@ async function assessScenery(routes, categories = null, opts = {}) {
   const queryCats = wanted && wanted.length ? wanted : CATEGORY_KEYS;
   const lines = routes.map(queryLine);
   if (lines.some((l) => l.length < 2)) return unavailable(routes.length, 'the routes had no geometry to analyse.');
-  const tiles = tilesFor(lines);
-  if (!tiles) return unavailable(routes.length, 'the route is too long to look up scenery without overloading the public OpenStreetMap server.');
+  const plan = planSegments(lines);
+  if (!plan) return unavailable(routes.length, 'the route is too long to look up scenery without overloading the public OpenStreetMap server.');
 
-  let step1;
-  try { step1 = await overpass.run(buildTileQuery(tiles.cells, queryCats), 'scenery-pois', opts); } catch (err) {
-    return unavailable(routes.length, `the OpenStreetMap Overpass service could not be reached (${err.kind || 'error'}).`);
-  }
-  const elements = step1.elements.filter((e) => (e.type === 'node' ? Number.isFinite(e.lat) : !!e.bounds));
-
-  // Areas that could possibly be in range (bounding-box distance is a lower bound): ask Overpass for the exact test.
-  const areaRefs = new Set();
-  elements.forEach((el) => {
-    if (el.type === 'node' || !classify(el.tags) || (wanted && !wanted.includes(classify(el.tags).category))) return;
-    if (lines.some((l) => distanceToBoxM(l, boundsOf(el)) <= config.scenery.maxM)) areaRefs.add(`${el.type}/${el.id}`);
+  const t0 = Date.now();
+  const results = await overpass.runMany(plan.map((s) => buildSegmentQuery(s.line, queryCats)), 'scenery-pois', opts);
+  const segments = plan.map((s, i) => {
+    const r = results[i];
+    if (!r.ok) return { ...s, ok: false, error: r.error };
+    try { return { ...s, ok: true, cached: r.cached, ...parseSegment(r.elements) }; } catch (error) { return { ...s, ok: false, error }; }
   });
-  let exact = null; let refineNote = null;
-  if (areaRefs.size && opts.deadline && opts.deadline - Date.now() < 6000) {
-    refineNote = 'exact outline test skipped (request time budget nearly used up); areas use bounding-box distance';
-  } else if (areaRefs.size) {
-    try {
-      const step2 = await overpass.run(buildRefineQuery([...areaRefs], lines), 'scenery-areas', opts);
-      exact = parseRefine(step2.elements, routes.length);
-    } catch (err) { refineNote = `exact outline test unavailable (${err.kind || 'error'}); areas use bounding-box distance`; }
+  const failed = segments.filter((s) => !s.ok);
+  if (failed.length === segments.length) {
+    const why = failed.find((s) => s.error.kind !== 'skipped')?.error.kind || 'error';
+    return unavailable(routes.length, `the OpenStreetMap Overpass service could not be reached (${why}).`);
   }
 
+  const data = lines.map((_, k) => collectRoute(segments.filter((s) => s.route === k)));
+  const short = data.map((d, k) => ({ d, k })).filter(({ d }) => d.coverage < config.scenery.minCoverage);
+  if (short.length) {
+    return unavailable(routes.length, `scenery data could only be retrieved for ${short.map(({ d, k }) => `${pct(d.coverage)} of ${routeName(k)}`).join(' and ')}; at least ${pct(config.scenery.minCoverage)} of every route is needed to give a score (missing data is not counted as "no scenery").`);
+  }
+
+  const incomplete = data.some((d) => d.failed > 0);
   const label = wanted && wanted.length ? list(wanted.map((c) => CATEGORIES[c].label)) : null;
   const perRoute = lines.map((line, i) => {
-    const s = scoreRoute(line, elements, exact ? exact[i] : null, wanted && wanted.length ? wanted : null);
+    const s = scoreRoute(line, data[i].elements, data[i].exact, wanted && wanted.length ? wanted : null);
+    const partial = data[i].failed > 0;
     return {
-      available: true, ...s, summary: describe(s, label), source: 'OpenStreetMap POIs via Overpass API',
+      available: true, ...s, summary: describe(s, label) + (partial ? INCOMPLETE_NOTE(data[i].coverage) : ''), source: 'OpenStreetMap POIs via Overpass API',
       thresholds: { nearM: config.scenery.nearM, maxM: config.scenery.maxM, maxPerCategory: config.scenery.maxPerCategory }, categoriesCounted: wanted && wanted.length ? wanted : CATEGORY_KEYS,
+      incomplete: partial, coverage: Math.round(data[i].coverage * 100) / 100,
       pois: s.pois.slice(0, 12),
     };
   });
-  log('SCENERY', `POI scores: ${perRoute.map((p) => `${p.score} (${p.totalPois} POIs)`).join(' / ')}${refineNote ? ` | ${refineNote}` : ''}`);
+  const note = incomplete
+    ? `incomplete: ${failed.length} of ${segments.length} corridor segments could not be retrieved (${[...new Set(failed.map((s) => s.error.kind))].join(', ')}); coverage ${data.map((d, k) => `${routeName(k)} ${pct(d.coverage)}`).join(', ')}`
+    : null;
+  log('SCENERY', `POI scores: ${perRoute.map((p) => `${p.score} (${p.totalPois} POIs)`).join(' / ')} | ${segments.length - failed.length}/${segments.length} segments${note ? ` | ${note}` : ''}`);
   return {
-    available: true, perRoute,
-    meta: { provider: 'Overpass', requested: true, cached: step1.cached, ms: step1.ms, categories: queryCats, tiles: tiles.cells.length, candidates: elements.length, ...(refineNote ? { note: refineNote } : {}) },
+    available: true, perRoute, ...(incomplete ? { incomplete: true } : {}),
+    meta: {
+      provider: 'Overpass', requested: true, cached: segments.every((s) => !s.ok || s.cached), ms: Date.now() - t0, categories: queryCats,
+      tiles: segments.length, segments: segments.length, segmentsFailed: failed.length, candidates: data.reduce((n, d) => n + d.elements.length, 0), ...(note ? { note } : {}),
+    },
   };
 }
 
 module.exports = {
-  assessScenery, unavailableFor: unavailable, scoreRoute, classify, dedupe, tilesFor, buildTileQuery, buildRefineQuery, parseRefine,
+  assessScenery, unavailableFor: unavailable, scoreRoute, classify, dedupe, planSegments, splitLine, buildSegmentQuery, parseSegment, collectRoute,
   distanceToBoxM, queryLine, CATEGORIES, CATEGORY_KEYS,
 };

@@ -13,6 +13,7 @@ const assert = require('node:assert/strict');
 const config = require('../src/config');
 const overpass = require('../src/services/overpass');
 const scenery = require('../src/services/scenery');
+const { polylineLengthM } = require('../src/utils');
 
 const OK = { version: 0.6, elements: [{ type: 'node', id: 1, lat: 1, lon: 2, tags: { natural: 'beach' } }] };
 let servers = [];
@@ -41,7 +42,7 @@ const use = (...list) => { config.overpass.urls = list.map((s) => s.url); };
 const keep = { ...config.overpass };
 beforeEach(() => {
   overpass._reset();
-  Object.assign(config.overpass, { timeoutMs: 400, retries: 1, backoffMs: 0, endpointCooldownMs: 30000, endpointCooldownMaxMs: 300000, failureCooldownMs: 30000 });
+  Object.assign(config.overpass, { timeoutMs: 400, retries: 1, backoffMs: 0, endpointCooldownMs: 30000, endpointCooldownMaxMs: 300000, failureCooldownMs: 30000, endpointFailureThreshold: 1, concurrency: 2, abortAfterFailures: 3 });
 });
 afterEach(async () => {
   for (const s of servers) { s.server.closeAllConnections(); await new Promise((r) => s.server.close(r)); }
@@ -296,42 +297,264 @@ describe('Overpass configuration', () => {
   });
 });
 
-describe('Better Scenery on top of the failover client', () => {
-  // Route A: a straight line at lat 13.0; a real-looking beach node 100 m north of it.
-  const route = { analysis: { line: [[13.0, 80.0], [13.0, 80.05], [13.0, 80.1]] } };
-  const beach = { type: 'node', id: 42, lat: 13.0009, lon: 80.05, tags: { natural: 'beach', name: 'Test Beach' } };
-  const tiles = (q, res) => sendJson(res, { version: 0.6, elements: [beach] });
-
-  it('first endpoint 504, second endpoint serves the POIs -> a real score from the real POI', async () => {
-    const a = await status(504); const b = await startServer(tiles); use(a, b);
-    const r = await scenery.assessScenery([route], ['beach']);
-    assert.equal(r.available, true);
-    assert.equal(r.perRoute[0].pois.length, 1);
-    assert.equal(r.perRoute[0].pois[0].name, 'Test Beach');
-    assert.ok(r.perRoute[0].score > 0);
-    assert.deepEqual([a.hits, b.hits], [1, 1]);
+describe('Overpass circuit breaker with multi-request searches', () => {
+  it('one failed request does not black out an endpoint (threshold 2); two in a row do; a success resets it', async () => {
+    config.overpass.endpointFailureThreshold = 2; config.overpass.retries = 0;
+    let healthy = false;
+    const a = await startServer((q, res) => (healthy ? sendJson(res, OK) : (res.writeHead(503), res.end('x')))); use(a);
+    await assert.rejects(() => overpass.run(uniqueQuery(), 'test'));
+    assert.equal(overpass._health.get(a.url).failures, 1);
+    await assert.rejects(() => overpass.run(uniqueQuery(), 'test'), (e) => e.kind === 'busy'); // still asked: not cooling after ONE failure
+    assert.equal(a.hits, 2);
+    await assert.rejects(() => overpass.run(uniqueQuery(), 'test'), (e) => e.kind === 'cooldown'); // two in a row -> skipped
+    assert.equal(a.hits, 2);
+    overpass._health.get(a.url).until = 0; healthy = true;
+    await overpass.run(uniqueQuery(), 'test');
+    assert.equal(overpass._health.has(a.url), false);
   });
 
-  it('all endpoints fail -> the honest "Scenery information unavailable" result: no POIs, no score', async () => {
-    const a = await status(502); const b = await status(504); const c = await hang(); use(a, b, c);
-    const r = await scenery.assessScenery([route, route], ['beach']);
-    assert.equal(r.available, false);
-    assert.match(r.reason, /could not be reached/);
-    assert.equal(r.perRoute.length, 2);
-    for (const p of r.perRoute) {
-      assert.equal(p.available, false);
-      assert.equal(p.score, null);
-      assert.deepEqual(p.pois, []);
-      assert.match(p.summary, /^Scenery information unavailable/);
+  it('a request that fails twice on the same endpoint (attempt + retry pass) still counts as ONE failure', async () => {
+    config.overpass.endpointFailureThreshold = 2; // retries = 1: two attempts per request
+    const a = await status(502); use(a);
+    await assert.rejects(() => overpass.run(uniqueQuery(), 'test'));
+    assert.equal(a.hits, 2);
+    assert.equal(overpass._health.get(a.url).failures, 1);
+    assert.equal(overpass._health.get(a.url).until, 0);
+  });
+
+  it('HTTP 429 opens the breaker at once even with a higher threshold', async () => {
+    config.overpass.endpointFailureThreshold = 5;
+    const a = await status(429, { 'Retry-After': '60' }); const b = await ok(); use(a, b);
+    await overpass.run(uniqueQuery(), 'test');
+    assert.ok(overpass._health.get(a.url).until > Date.now() + 50000);
+  });
+});
+
+/** A server that sees the query text: behave(query, res, hitNumber). */
+async function queryServer(behave) {
+  const s = await startServer(() => {});
+  s.server.removeAllListeners('request');
+  s.server.on('request', (req, res) => {
+    let raw = ''; req.on('data', (c) => (raw += c));
+    req.on('end', () => { s.hits++; s.headers.push(req.headers); behave(new URLSearchParams(raw).get('data') || '', res, s.hits); });
+  });
+  s.hits = 0;
+  return s;
+}
+
+describe('Overpass runMany (the pieces of one search)', () => {
+  it('runs every query, keeps the order of the results, and each result is cached on its own', async () => {
+    const a = await ok(); use(a);
+    const qs = [uniqueQuery(), uniqueQuery(), uniqueQuery()];
+    const r = await overpass.runMany(qs, 'test');
+    assert.deepEqual(r.map((x) => x.ok), [true, true, true]);
+    assert.equal(a.hits, 3);
+    const again = await overpass.runMany(qs, 'test');
+    assert.ok(again.every((x) => x.ok && x.cached));
+    assert.equal(a.hits, 3);
+  });
+
+  it('one failing piece does not stop the others; a re-run only re-sends the failed piece', async () => {
+    config.overpass.endpointFailureThreshold = 2; config.overpass.retries = 0;
+    let failBad = true;
+    const a = await queryServer((q, res) => (q.includes('BAD') && failBad ? (res.writeHead(504), res.end('x')) : sendJson(res, OK))); use(a);
+    const qs = [uniqueQuery(), `${uniqueQuery()} BAD`, uniqueQuery()];
+    const r = await overpass.runMany(qs, 'test');
+    assert.deepEqual(r.map((x) => x.ok), [true, false, true]);
+    assert.equal(r[1].error.kind, 'busy');
+    const hits = a.hits;
+    overpass._failures.clear(); failBad = false;
+    const again = await overpass.runMany(qs, 'test');
+    assert.ok(again.every((x) => x.ok));
+    assert.deepEqual(again.map((x) => x.cached), [true, false, true]);
+    assert.equal(a.hits, hits + 1);
+  });
+
+  it('stops sending the rest when the first requests all fail (does not hammer a dead server)', async () => {
+    config.overpass.abortAfterFailures = 2; config.overpass.retries = 0; config.overpass.concurrency = 1;
+    config.overpass.endpointFailureThreshold = 99; // keep the endpoint breaker out of the way: this is the search-level stop
+    const a = await status(504); use(a);
+    const r = await overpass.runMany(Array.from({ length: 8 }, uniqueQuery), 'test');
+    assert.equal(a.hits, 2);
+    assert.deepEqual(r.map((x) => x.error.kind), ['busy', 'busy', ...Array(6).fill('skipped')]);
+  });
+
+  it('does not stop early once something has succeeded', async () => {
+    config.overpass.abortAfterFailures = 2; config.overpass.retries = 0; config.overpass.concurrency = 1; config.overpass.endpointFailureThreshold = 99;
+    const a = await startServer((q, res, hit) => (hit % 2 ? sendJson(res, OK) : (res.writeHead(504), res.end('x')))); use(a);
+    const r = await overpass.runMany(Array.from({ length: 6 }, uniqueQuery), 'test');
+    assert.equal(a.hits, 6);
+    assert.deepEqual(r.map((x) => x.ok), [true, false, true, false, true, false]);
+  });
+
+  it('never has more than OVERPASS_CONCURRENCY requests in flight', async () => {
+    let now = 0; let peak = 0;
+    const a = await startServer((q, res) => { now++; peak = Math.max(peak, now); setTimeout(() => { now--; sendJson(res, OK); }, 40); }); use(a);
+    config.overpass.concurrency = 2;
+    await overpass.runMany(Array.from({ length: 6 }, uniqueQuery), 'test');
+    assert.equal(peak, 2);
+  });
+});
+
+describe('Better Scenery: corridor segments', () => {
+  // ~100 m north of the route, at its middle
+  const beach = { type: 'node', id: 42, lat: 13.0009, lon: 80.3, tags: { natural: 'beach', name: 'Test Beach' } };
+  const park = { type: 'way', id: 7, bounds: { minlat: 13.0005, minlon: 80.29, maxlat: 13.0015, maxlon: 80.31 }, tags: { leisure: 'park', name: 'Test Park' } };
+  // a ~65 km west-east route -> 4 segments of ~16 km
+  const long = { analysis: { line: Array.from({ length: 14 }, (_, i) => [13.0, 80.0 + i * 0.05]) } };
+  const polyOf = (q) => {
+    const n = /\(around:\d+,([^)]*)\)/.exec(q)[1].split(',').map(Number);
+    const p = []; for (let i = 0; i < n.length; i += 2) p.push([n[i], n[i + 1]]);
+    return p;
+  };
+
+  /** Overpass stand-in: answers a corridor request with the POIs inside its polyline's lon range; fail(points) -> HTTP 504. */
+  const corridor = async (fail = () => false) => {
+    const seen = [];
+    const s = await queryServer((q, res) => {
+      const pts = polyOf(q); seen.push({ q, pts });
+      if (fail(pts)) { res.writeHead(504); return res.end('x'); }
+      const lo = Math.min(...pts.map((p) => p[1])) - 0.01; const hi = Math.max(...pts.map((p) => p[1])) + 0.01;
+      const inside = [beach, park].filter((e) => { const lon = e.lon ?? (e.bounds.minlon + e.bounds.maxlon) / 2; return lon >= lo && lon <= hi; });
+      sendJson(res, { elements: [...inside, { type: 'count', id: 0 }, ...inside.filter((e) => e.type !== 'node').map((e) => ({ type: e.type, id: e.id }))] });
+    });
+    s.seen = seen;
+    return s;
+  };
+
+  it('a long route becomes several SMALL corridor requests, not one big bounding box', async () => {
+    const a = await corridor(); use(a);
+    const r = await scenery.assessScenery([long], ['beach', 'park']);
+    assert.equal(r.available, true);
+    assert.equal(a.hits, 4);
+    assert.equal(r.meta.segments, 4);
+    for (const { q, pts } of a.seen) {
+      assert.match(q, /around:1000,/);
+      assert.doesNotMatch(q, /nwr\[[^\]]*\](\[[^\]]*\])*\(-?\d/); // no bounding-box statements
+      assert.ok(q.length < 3000, `query size ${q.length}`);
+      assert.ok(polylineLengthM(pts) < 20000 * 1.2, `segment length ${polylineLengthM(pts)}`);
+    }
+    assert.deepEqual(r.perRoute[0].pois.map((p) => p.name).sort(), ['Test Beach', 'Test Park']);
+    assert.equal(r.perRoute[0].incomplete, false);
+    assert.equal(r.perRoute[0].coverage, 1);
+    assert.equal(r.incomplete, undefined);
+  });
+
+  it('only the requested categories are queried (beach + park -> 2 data statements per segment)', async () => {
+    const a = await corridor(); use(a);
+    await scenery.assessScenery([long], ['beach', 'park']);
+    for (const { q } of a.seen) {
+      assert.equal((q.match(/nwr\[[^\n]*?\(around:1000/g) || []).length, 2);
+      assert.doesNotMatch(q, /waterfall|national_park|forest/);
     }
   });
 
-  it('the scoring is unchanged by the transport: same POI, same score from any endpoint', async () => {
-    const a = await startServer(tiles); use(a);
-    const first = await scenery.assessScenery([route], ['beach']);
+  it('total requests are capped: long routes get longer segments, absurd routes are reported as too long', async () => {
+    const a = await corridor(); use(a);
+    const line = (km) => ({ analysis: { line: Array.from({ length: 41 }, (_, i) => [13.0, 80.0 + (i * km) / 40 / 108.4]) } });
+    const mid = await scenery.assessScenery([line(250)], ['beach']); // 250 km -> 13 pieces of ~19 km
+    assert.ok(mid.available);
+    assert.ok(a.hits <= config.scenery.maxRequests, `hits ${a.hits}`);
+    const before = a.hits;
+    const tooLong = await scenery.assessScenery([line(900)], ['beach']);
+    assert.equal(tooLong.available, false);
+    assert.match(tooLong.reason, /too long/);
+    assert.equal(a.hits, before); // nothing was sent for the too-long route
+  });
+
+  it('two routes share the request budget', () => {
+    const lines = [long, long].map(scenery.queryLine);
+    const plan = scenery.planSegments(lines);
+    assert.ok(plan.length <= config.scenery.maxRequests);
+    assert.deepEqual([...new Set(plan.map((s) => s.route))], [0, 1]);
+  });
+
+  it('one segment fails: the score comes from the rest and is clearly flagged incomplete (not zero, not hidden)', async () => {
+    config.overpass.endpointFailureThreshold = 2; // one failed request must not black out the other segments
+    const a = await corridor((pts) => pts[0][1] < 80.05); use(a); // the FIRST segment (no POIs in it) fails
+    const r = await scenery.assessScenery([long], ['beach', 'park']);
+    assert.equal(r.available, true);
+    assert.equal(r.incomplete, true);
+    const p = r.perRoute[0];
+    assert.equal(p.incomplete, true);
+    assert.ok(p.coverage > 0.7 && p.coverage < 1, `coverage ${p.coverage}`);
+    assert.ok(p.score > 0);
+    assert.match(p.summary, /Data incomplete/);
+    assert.match(p.summary, new RegExp(`${Math.round(p.coverage * 100)} %`));
+    assert.equal(r.meta.segmentsFailed, 1);
+    assert.match(r.meta.note, /incomplete: 1 of 4/);
+  });
+
+  it('a segment that held the places fails: they are NOT invented, and the result says the data is incomplete', async () => {
+    config.overpass.endpointFailureThreshold = 2;
+    const a1 = await corridor(); use(a1);
+    const full = await scenery.assessScenery([long], ['beach', 'park']);
     overpass._reset();
-    const b = await status(503); const c = await startServer(tiles); use(b, c);
-    const second = await scenery.assessScenery([route], ['beach']);
+    const a2 = await corridor((pts) => Math.min(...pts.map((p) => p[1])) <= 80.3 && Math.max(...pts.map((p) => p[1])) >= 80.3); use(a2);
+    const part = await scenery.assessScenery([long], ['beach', 'park']);
+    assert.equal(part.available, true);
+    assert.equal(part.perRoute[0].incomplete, true);
+    assert.ok(part.perRoute[0].totalPois < full.perRoute[0].totalPois);
+    assert.ok(part.perRoute[0].pois.every((x) => ['Test Beach', 'Test Park'].includes(x.name)));
+    assert.match(part.perRoute[0].summary, /Data incomplete/);
+  });
+
+  it('only the failed segment is requested again on the next search; the others come from the cache', async () => {
+    config.overpass.endpointFailureThreshold = 2; config.overpass.retries = 0;
+    let broken = true;
+    const a = await corridor((pts) => broken && pts[0][1] < 80.05); use(a);
+    await scenery.assessScenery([long], ['beach', 'park']);
+    assert.equal(a.hits, 4);
+    broken = false; overpass._failures.clear();
+    const again = await scenery.assessScenery([long], ['beach', 'park']);
+    assert.equal(a.hits, 5); // exactly one more request
+    assert.equal(again.perRoute[0].incomplete, false);
+    assert.equal(again.incomplete, undefined);
+  });
+
+  it('too much missing: unavailable with the coverage in the reason - never a score of 0', async () => {
+    config.overpass.endpointFailureThreshold = 99; config.overpass.retries = 0;
+    const a = await corridor((pts) => pts[0][1] < 80.35); use(a); // the first half fails
+    const r = await scenery.assessScenery([long], ['beach', 'park']);
+    assert.equal(r.available, false);
+    assert.match(r.reason, /could only be retrieved for \d+ % of Route A/);
+    assert.match(r.reason, /missing data is not counted as "no scenery"/);
+    assert.equal(r.perRoute[0].score, null);
+    assert.deepEqual(r.perRoute[0].pois, []);
+    assert.match(r.perRoute[0].summary, /^Scenery information unavailable/);
+  });
+
+  it('every request fails -> "could not be reached", and the rest of the segments are not even sent', async () => {
+    config.overpass.retries = 0; config.overpass.abortAfterFailures = 2; config.overpass.concurrency = 1; config.overpass.endpointFailureThreshold = 99;
+    const a = await status(504); use(a);
+    const r = await scenery.assessScenery([long, long], ['beach']); // 2 routes x 4 segments
+    assert.equal(r.available, false);
+    assert.match(r.reason, /could not be reached \(busy\)/);
+    assert.equal(a.hits, 2); // two failures, then the other pieces are skipped
+    for (const p of r.perRoute) { assert.equal(p.score, null); assert.deepEqual(p.pois, []); }
+  });
+
+  it('all endpoints fail on every segment -> honest unavailable result, nothing invented', async () => {
+    const a = await status(502); const b = await status(504); const d = await hang(); use(a, b, d);
+    const r = await scenery.assessScenery([{ analysis: { line: [[13.0, 80.0], [13.0, 80.1]] } }], ['beach']);
+    assert.equal(r.available, false);
+    assert.match(r.perRoute[0].summary, /^Scenery information unavailable/);
+    assert.equal(r.perRoute[0].score, null);
+  });
+
+  it('failover works per segment: a 504 on the first endpoint, the second serves the POIs', async () => {
+    const good = await corridor(); const bad = await status(504); use(bad, good);
+    const r = await scenery.assessScenery([long], ['beach', 'park']);
+    assert.equal(r.available, true);
+    assert.equal(r.perRoute[0].pois.length, 2);
+  });
+
+  it('the scoring is unchanged by the transport: the same POIs give the same score from any endpoint', async () => {
+    const a1 = await corridor(); use(a1);
+    const first = await scenery.assessScenery([long], ['beach', 'park']);
+    overpass._reset();
+    const bad = await status(503); const a2 = await corridor(); use(bad, a2);
+    const second = await scenery.assessScenery([long], ['beach', 'park']);
     assert.equal(second.perRoute[0].score, first.perRoute[0].score);
     assert.deepEqual(second.perRoute[0].pois, first.perRoute[0].pois);
   });

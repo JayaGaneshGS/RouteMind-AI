@@ -78,12 +78,21 @@ async function attempt(url, query, timeoutMs) {
 
 /* ---------- Endpoint health (circuit breaker) ---------- */
 
+/**
+ * Records that a whole request failed on this endpoint (called once per request and endpoint, not once per attempt).
+ * The endpoint is skipped only after `endpointFailureThreshold` consecutive failed requests - or at once for HTTP 429 /
+ * a Retry-After header - so one failed piece of a multi-request search cannot black out the other pieces. The skip time
+ * is `endpointCooldownMs`, doubling per further consecutive failure, up to `endpointCooldownMaxMs`.
+ */
 function markFailure(url, err) {
   const h = health.get(url) || { failures: 0, until: 0, reason: '' };
   h.failures++;
-  const own = Math.min(config.overpass.endpointCooldownMaxMs, config.overpass.endpointCooldownMs * 2 ** (h.failures - 1));
-  h.until = Date.now() + Math.max(own, Math.min(config.overpass.endpointCooldownMaxMs, err.retryAfterMs || 0));
   h.reason = err.message;
+  const immediate = err.status === 429 || err.retryAfterMs > 0;
+  if (h.failures >= config.overpass.endpointFailureThreshold || immediate) {
+    const own = Math.min(config.overpass.endpointCooldownMaxMs, config.overpass.endpointCooldownMs * 2 ** Math.max(0, h.failures - config.overpass.endpointFailureThreshold));
+    h.until = Date.now() + Math.max(own, Math.min(config.overpass.endpointCooldownMaxMs, err.retryAfterMs || 0));
+  }
   health.set(url, h);
 }
 const markSuccess = (url) => health.delete(url);
@@ -104,6 +113,8 @@ async function execute(query, label, opts) {
     throw new OverpassError('cooldown', `All ${config.overpass.urls.length} Overpass endpoint(s) failed a moment ago; not asking again for ${Math.max(1, Math.round((soon - Date.now()) / 1000))} s.`);
   }
   const tried = [];
+  const failedHere = new Map(); // endpoint -> last error in THIS request; recorded once, when the request is over
+  const settle = () => failedHere.forEach((e, u) => markFailure(u, e));
   let lastErr = null;
 
   for (let pass = 0; pass <= config.overpass.retries; pass++) {
@@ -113,6 +124,8 @@ async function execute(query, label, opts) {
       const t = Date.now();
       try {
         const elements = await attempt(url, query, Math.min(config.overpass.timeoutMs, left()));
+        failedHere.delete(url);
+        settle();
         markSuccess(url);
         tried.push({ endpoint: safeUrl(url), outcome: 'ok' });
         diagnostics.record(`overpass@${hostOf(url)}`, { ok: true, ms: Date.now() - t });
@@ -124,7 +137,7 @@ async function execute(query, label, opts) {
         diagnostics.record(`overpass@${hostOf(url)}`, { ok: false, ms: Date.now() - t, detail: e.message });
         warn('OVERPASS', `${label}: ${hostOf(url)} - ${e.message}${pool.length > 1 || pass < config.overpass.retries ? '; trying the next option' : ''}`);
         if (e.fatal) { e.attempts = tried; throw e; }
-        markFailure(url, e);
+        failedHere.set(url, e);
         if (e.retryNext) retryPool.push(url);
       }
     }
@@ -137,6 +150,7 @@ async function execute(query, label, opts) {
     await sleep(wait);
   }
 
+  settle();
   const err = lastErr
     ? new OverpassError(lastErr.kind, `All ${tried.length} Overpass attempt(s) failed - ${tried.map((a) => `${hostOf(a.endpoint)}: ${a.outcome}`).join('; ')}`)
     : new OverpassError('timeout', 'no time left in the request budget');
@@ -185,10 +199,39 @@ async function run(query, label, opts = {}) {
   try { return await promise; } finally { inflight.delete(key); }
 }
 
+/**
+ * Runs several INDEPENDENT queries (e.g. the corridor segments of one search) with limited concurrency, so one slow or
+ * failed piece does not sink the others. Every query goes through run(), so each keeps its own cache entry, in-flight
+ * de-duplication, endpoint failover and cool-downs. Never throws; resolves to one entry per query, in order:
+ *   { ok: true, elements, cached, ms, endpoint }   or   { ok: false, error: OverpassError }
+ * If `abortAfterFailures` requests fail before ANY has succeeded, the remaining ones are not sent (error kind 'skipped'):
+ * a dead network must not be hammered with the rest of a long route.
+ */
+async function runMany(queries, label, opts = {}) {
+  const results = new Array(queries.length);
+  const stopAt = config.overpass.abortAfterFailures;
+  let next = 0; let failures = 0; let successes = 0;
+  const worker = async () => {
+    while (next < queries.length) {
+      const i = next++;
+      if (stopAt > 0 && !successes && failures >= stopAt) {
+        results[i] = { ok: false, error: new OverpassError('skipped', `not sent: ${failures} requests in a row failed, Overpass looks unavailable`) };
+        continue;
+      }
+      try { results[i] = { ok: true, ...(await run(queries[i], `${label} ${i + 1}/${queries.length}`, opts)) }; successes++; } catch (err) {
+        results[i] = { ok: false, error: err instanceof OverpassError ? err : new OverpassError('http', err.message) };
+        failures++;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(config.overpass.concurrency, queries.length)) }, worker));
+  return results;
+}
+
 /** Overpass `[timeout:N]` header value (seconds) kept just under our own HTTP timeout. */
 const serverTimeoutSeconds = () => Math.max(5, Math.floor(config.overpass.timeoutMs / 1000) - 3);
 
 /** Test helper: forget all cached results, failures and endpoint health. */
 const _reset = () => { cache.clear(); failures.clear(); health.clear(); throttles.clear(); inflight.clear(); };
 
-module.exports = { run, OverpassError, serverTimeoutSeconds, _cache: cache, _failures: failures, _health: health, _inflight: inflight, _reset, _backoff: backoff };
+module.exports = { run, runMany, OverpassError, serverTimeoutSeconds, _cache: cache, _failures: failures, _health: health, _inflight: inflight, _reset, _backoff: backoff };

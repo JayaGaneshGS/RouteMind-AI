@@ -7,7 +7,7 @@ import RouteMap from '../components/RouteMap';
 import { RoadDetails, SceneryDetails } from '../components/RouteDetails';
 import { ErrorBanner, Icon, Notice, PageHeader, TrafficBadge } from '../components/ui';
 import { RESULT_KEY } from './Planner';
-import { errorMessage, formatDuration, inr, prefLabel, roadLine, sceneryLine, weightsText } from '../utils';
+import { errorMessage, formatDuration, inr, overpassText, prefLabel, roadLine, sceneryLine, weightsText } from '../utils';
 
 function loadResult(state) {
   if (state?.result) return state.result;
@@ -37,8 +37,6 @@ function Diagnostics({ d }) {
     </details>
   );
 }
-
-const overpassText = (m) => (typeof m === 'string' ? m : `${m.provider}${m.requested === false ? ' · request not completed' : m.cached ? ' (cached)' : ` · ${m.ms} ms`}${m.samples ? ` · ${m.samples} sample points` : ''}${m.tiles ? ` · ${m.tiles} map tiles, ${m.candidates} candidates` : ''}${m.note ? ` · ${m.note}` : ''}`);
 
 const PROB_COLORS = { LOW: 'bg-emerald-500', MEDIUM: 'bg-amber-400', HIGH: 'bg-red-500' };
 

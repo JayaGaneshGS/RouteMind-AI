@@ -58,7 +58,6 @@ export default function Dashboard() {
           {mlDown && <p className="mt-3 text-sm text-amber-700">The ML service is not reachable right now. Route search falls back to a simple rule-of-thumb.</p>}
           {info && (
             <>
-              <p className="mt-1 text-xs text-slate-500">{info.model}. Trained on {info.train_rows} rows, tested on {info.test_rows}. {info.dataset}.</p>
               <dl className="mt-3 grid grid-cols-4 gap-2 text-center text-sm">
                 {[['Accuracy', info.accuracy], ['Precision', info.precision_weighted], ['Recall', info.recall_weighted], ['F1', info.f1_weighted]].map(([k, v]) => (
                   <div key={k} className="rounded-lg bg-slate-50 p-2"><dt className="text-[11px] text-slate-500">{k}</dt><dd className="font-bold">{(v * 100).toFixed(1)}%</dd></div>
